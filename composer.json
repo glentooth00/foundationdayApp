@@ -1,0 +1,9 @@
+{
+    "name": "ileco3/app",
+    "autoload": {
+        "psr-4": {
+            "Ileco3\\App\\": "src/"
+        }
+    },
+    "require": {}
+}
