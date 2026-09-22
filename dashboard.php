@@ -640,7 +640,7 @@ $recentActivity = [
             <span>Candidates</span>
         </a>
 
-        <a href="employees.php">
+        <a href="registrations.php">
             <i class="bi bi-people-fill"></i>
             <span>Employees</span>
         </a>

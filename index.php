@@ -3,10 +3,116 @@
 session_start();
 
 require_once "includes/db.php";
-require_once "includes/functions.php";
 
-$error = "";
-$success = false;
+/*
+|--------------------------------------------------------------------------
+| Device Token
+|--------------------------------------------------------------------------
+*/
+
+if (empty($_COOKIE["fd_device_token"])) {
+
+    try {
+        $deviceToken = bin2hex(random_bytes(32));
+    } catch (Exception $e) {
+        $deviceToken = hash(
+            "sha256",
+            uniqid(mt_rand(), true)
+        );
+    }
+
+    setcookie(
+        "fd_device_token",
+        $deviceToken,
+        array(
+            "expires"  => time() + (365 * 24 * 60 * 60),
+            "path"     => "/",
+            "secure"   => (!empty($_SERVER["HTTPS"]) && $_SERVER["HTTPS"] !== "off"),
+            "httponly" => true,
+            "samesite" => "Lax"
+        )
+    );
+
+} else {
+
+    $deviceToken = $_COOKIE["fd_device_token"];
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Check Existing Device
+|--------------------------------------------------------------------------
+*/
+
+$existingEmployee = null;
+
+if (!empty($deviceToken)) {
+
+    $stmt = $conn->prepare("
+        SELECT
+            id,
+            full_name,
+            voting_status
+        FROM employees
+        WHERE device_token = ?
+        LIMIT 1
+    ");
+
+    if ($stmt) {
+
+        $stmt->bind_param(
+            "s",
+            $deviceToken
+        );
+
+        $stmt->execute();
+
+        $result =
+            $stmt->get_result();
+
+        $existingEmployee =
+            $result->fetch_assoc();
+
+        $stmt->close();
+    }
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Existing Employee
+|--------------------------------------------------------------------------
+|
+| If this device has already registered:
+|
+| - Already voted  -> show registration block
+| - Not voted      -> show registration block
+|
+| We do NOT redirect to voting.php anymore.
+|
+*/
+
+$existingRegistration = false;
+
+if ($existingEmployee) {
+
+    $existingRegistration = true;
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Variables
+|--------------------------------------------------------------------------
+*/
+
+$errors = array();
+
+$fullName = "";
+$gender = "";
+
+$registrationSuccess = false;
 
 
 /*
@@ -15,9 +121,20 @@ $success = false;
 |--------------------------------------------------------------------------
 */
 
-if ($_SERVER["REQUEST_METHOD"] === "POST") {
+if (
+    $_SERVER["REQUEST_METHOD"] === "POST" &&
+    !$existingRegistration
+) {
 
-    $fullName = trim($_POST["full_name"] ?? "");
+    $fullName = trim(
+        isset($_POST["full_name"])
+            ? $_POST["full_name"]
+            : ""
+    );
+
+    $gender = isset($_POST["gender"])
+        ? strtolower(trim($_POST["gender"]))
+        : "";
 
 
     /*
@@ -28,74 +145,37 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
     if ($fullName === "") {
 
-        $error = "Please enter your full name.";
+        $errors[] =
+            "Please enter your full name.";
 
-    } elseif (!isValidCandidateName($fullName)) {
+    } elseif (strlen($fullName) < 3) {
 
-        $error = "Please enter a valid full name.";
+        $errors[] =
+            "Please enter a valid full name.";
+
+    } elseif (strlen($fullName) > 150) {
+
+        $errors[] =
+            "Full name must not exceed 150 characters.";
     }
 
 
     /*
     |--------------------------------------------------------------------------
-    | Validate Selfie
+    | Validate Gender
     |--------------------------------------------------------------------------
     */
 
-    if ($error === "") {
+    if (
+        !in_array(
+            $gender,
+            array("male", "female"),
+            true
+        )
+    ) {
 
-        if (
-            !isset($_FILES["selfie"]) ||
-            $_FILES["selfie"]["error"] !== UPLOAD_ERR_OK
-        ) {
-
-            $error =
-                "A selfie is required. Please take your selfie before registering.";
-        }
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Validate Selfie Size
-    |--------------------------------------------------------------------------
-    */
-
-    if ($error === "") {
-
-        if ($_FILES["selfie"]["size"] > 5 * 1024 * 1024) {
-
-            $error =
-                "Your selfie must not exceed 5MB.";
-        }
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Validate Actual Image
-    |--------------------------------------------------------------------------
-    */
-
-    if ($error === "") {
-
-        $finfo = new finfo(FILEINFO_MIME_TYPE);
-
-        $mime = $finfo->file(
-            $_FILES["selfie"]["tmp_name"]
-        );
-
-        $allowedTypes = [
-            "image/jpeg" => "jpg",
-            "image/png"  => "png",
-            "image/webp" => "webp"
-        ];
-
-        if (!isset($allowedTypes[$mime])) {
-
-            $error =
-                "Please provide a valid JPG, PNG, or WEBP selfie.";
-        }
+        $errors[] =
+            "Please select your gender.";
     }
 
 
@@ -105,39 +185,36 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     |--------------------------------------------------------------------------
     */
 
-    if ($error === "") {
-
-        $normalizedName = strtolower(
-            preg_replace(
-                "/\s+/",
-                " ",
-                trim($fullName)
-            )
+    $normalizedName =
+        preg_replace(
+            "/\s+/",
+            " ",
+            strtolower($fullName)
         );
 
+    $normalizedName =
+        trim($normalizedName);
 
-        /*
-        |--------------------------------------------------------------------------
-        | Check Existing Employee
-        |--------------------------------------------------------------------------
-        */
 
-        $stmt = $conn->prepare(
-            "SELECT
+    /*
+    |--------------------------------------------------------------------------
+    | Duplicate Name Check
+    |--------------------------------------------------------------------------
+    */
+
+    if (empty($errors)) {
+
+        $stmt = $conn->prepare("
+            SELECT
                 id,
-                registration_status,
+                full_name,
                 voting_status
-             FROM employees
-             WHERE normalized_name = ?
-             LIMIT 1"
-        );
+            FROM employees
+            WHERE normalized_name = ?
+            LIMIT 1
+        ");
 
-        if (!$stmt) {
-
-            $error =
-                "Unable to process registration.";
-
-        } else {
+        if ($stmt) {
 
             $stmt->bind_param(
                 "s",
@@ -146,53 +223,366 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
             $stmt->execute();
 
-            $result = $stmt->get_result();
+            $result =
+                $stmt->get_result();
+
+            $duplicate =
+                $result->fetch_assoc();
+
+            if ($duplicate) {
+
+                $errors[] =
+                    "This employee is already registered.";
+
+            }
+
+            $stmt->close();
+        }
+    }
 
 
-            if ($result->num_rows > 0) {
+    /*
+    |--------------------------------------------------------------------------
+    | Selfie Validation
+    |--------------------------------------------------------------------------
+    */
 
-                $existingEmployee =
-                    $result->fetch_assoc();
+    $selfiePath = null;
 
-                $stmt->close();
+    if (
+        empty($errors) &&
+        (
+            !isset($_FILES["selfie"]) ||
+            $_FILES["selfie"]["error"] !== UPLOAD_ERR_OK
+        )
+    ) {
+
+        $errors[] =
+            "Please take a selfie or upload a photo.";
+    }
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Process Image
+    |--------------------------------------------------------------------------
+    */
+
+    if (empty($errors)) {
+
+        $file =
+            $_FILES["selfie"];
+
+
+        /*
+        |--------------------------------------------------------------------------
+        | Maximum Original Upload
+        |--------------------------------------------------------------------------
+        */
+
+        if (
+            $file["size"] >
+            (5 * 1024 * 1024)
+        ) {
+
+            $errors[] =
+                "The photo must not exceed 5 MB.";
+        }
+
+
+        /*
+        |--------------------------------------------------------------------------
+        | Validate MIME Type
+        |--------------------------------------------------------------------------
+        */
+
+        if (empty($errors)) {
+
+            $finfo =
+                new finfo(
+                    FILEINFO_MIME_TYPE
+                );
+
+            $mimeType =
+                $finfo->file(
+                    $file["tmp_name"]
+                );
+
+
+            $allowedTypes = array(
+                "image/jpeg",
+                "image/png",
+                "image/webp"
+            );
+
+
+            if (
+                !in_array(
+                    $mimeType,
+                    $allowedTypes,
+                    true
+                )
+            ) {
+
+                $errors[] =
+                    "Please upload a JPG, PNG, or WEBP image.";
+            }
+        }
+
+
+        /*
+        |--------------------------------------------------------------------------
+        | Save Image
+        |--------------------------------------------------------------------------
+        */
+
+        if (empty($errors)) {
+
+            $uploadDirectory =
+                __DIR__ .
+                "/uploads/employees/";
+
+
+            if (!is_dir($uploadDirectory)) {
+
+                mkdir(
+                    $uploadDirectory,
+                    0775,
+                    true
+                );
+            }
+
+
+            /*
+            |--------------------------------------------------------------------------
+            | Generate Filename
+            |--------------------------------------------------------------------------
+            */
+
+            try {
+
+                $fileName =
+                    bin2hex(
+                        random_bytes(16)
+                    ) .
+                    ".jpg";
+
+            } catch (Exception $e) {
+
+                $fileName =
+                    sha1(
+                        uniqid(
+                            mt_rand(),
+                            true
+                        )
+                    ) .
+                    ".jpg";
+            }
+
+
+            $targetPath =
+                $uploadDirectory .
+                $fileName;
+
+
+            /*
+            |--------------------------------------------------------------------------
+            | Image Processing
+            |--------------------------------------------------------------------------
+            */
+
+            $saved = false;
+
+
+            if (
+                function_exists(
+                    "imagecreatefromjpeg"
+                )
+            ) {
+
+                $sourceImage = false;
+
+
+                switch ($mimeType) {
+
+                    case "image/jpeg":
+
+                        $sourceImage =
+                            @imagecreatefromjpeg(
+                                $file["tmp_name"]
+                            );
+
+                        break;
+
+
+                    case "image/png":
+
+                        $sourceImage =
+                            @imagecreatefrompng(
+                                $file["tmp_name"]
+                            );
+
+                        break;
+
+
+                    case "image/webp":
+
+                        if (
+                            function_exists(
+                                "imagecreatefromwebp"
+                            )
+                        ) {
+
+                            $sourceImage =
+                                @imagecreatefromwebp(
+                                    $file["tmp_name"]
+                                );
+                        }
+
+                        break;
+                }
 
 
                 if (
-                    $existingEmployee["registration_status"]
-                    === "pending"
+                    $sourceImage !== false
                 ) {
 
-                    $error =
-                        "This employee is already registered and is waiting for administrator approval.";
+                    $originalWidth =
+                        imagesx(
+                            $sourceImage
+                        );
 
-                } elseif (
-                    $existingEmployee["registration_status"]
-                    === "approved"
-                    &&
-                    $existingEmployee["voting_status"]
-                    === "not_voted"
-                ) {
+                    $originalHeight =
+                        imagesy(
+                            $sourceImage
+                        );
 
-                    $error =
-                        "This employee is already registered and approved. You may proceed to voting.";
 
-                } elseif (
-                    $existingEmployee["voting_status"]
-                    === "voted"
-                ) {
+                    /*
+                    |--------------------------------------------------------------------------
+                    | Maximum Dimensions
+                    |--------------------------------------------------------------------------
+                    */
 
-                    $error =
-                        "This employee has already completed voting.";
+                    $maxWidth = 1000;
+                    $maxHeight = 1000;
 
-                } else {
 
-                    $error =
-                        "This name is already registered. Please contact the administrator.";
+                    $scale =
+                        min(
+                            1,
+                            $maxWidth / $originalWidth,
+                            $maxHeight / $originalHeight
+                        );
+
+
+                    $newWidth =
+                        max(
+                            1,
+                            (int) round(
+                                $originalWidth * $scale
+                            )
+                        );
+
+
+                    $newHeight =
+                        max(
+                            1,
+                            (int) round(
+                                $originalHeight * $scale
+                            )
+                        );
+
+
+                    $outputImage =
+                        imagecreatetruecolor(
+                            $newWidth,
+                            $newHeight
+                        );
+
+
+                    /*
+                    |--------------------------------------------------------------------------
+                    | White Background
+                    |--------------------------------------------------------------------------
+                    */
+
+                    $white =
+                        imagecolorallocate(
+                            $outputImage,
+                            255,
+                            255,
+                            255
+                        );
+
+
+                    imagefill(
+                        $outputImage,
+                        0,
+                        0,
+                        $white
+                    );
+
+
+                    imagecopyresampled(
+                        $outputImage,
+                        $sourceImage,
+                        0,
+                        0,
+                        0,
+                        0,
+                        $newWidth,
+                        $newHeight,
+                        $originalWidth,
+                        $originalHeight
+                    );
+
+
+                    $saved =
+                        imagejpeg(
+                            $outputImage,
+                            $targetPath,
+                            82
+                        );
+
+
+                    imagedestroy(
+                        $sourceImage
+                    );
+
+                    imagedestroy(
+                        $outputImage
+                    );
                 }
+            }
+
+
+            /*
+            |--------------------------------------------------------------------------
+            | GD Fallback
+            |--------------------------------------------------------------------------
+            */
+
+            if (!$saved) {
+
+                $saved =
+                    move_uploaded_file(
+                        $file["tmp_name"],
+                        $targetPath
+                    );
+            }
+
+
+            if (!$saved) {
+
+                $errors[] =
+                    "Unable to save the uploaded photo.";
 
             } else {
 
-                $stmt->close();
+                $selfiePath =
+                    "uploads/employees/" .
+                    $fileName;
             }
         }
     }
@@ -200,109 +590,57 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 
     /*
     |--------------------------------------------------------------------------
-    | Create Upload Directory
+    | Insert Employee
     |--------------------------------------------------------------------------
     */
 
-    if ($error === "") {
+    if (empty($errors)) {
 
-        $uploadDirectory =
-            __DIR__ . "/uploads/employees/";
-
-
-        if (!is_dir($uploadDirectory)) {
-
-            if (!mkdir($uploadDirectory, 0755, true)) {
-
-                $error =
-                    "Unable to create the selfie upload directory.";
-            }
-        }
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Save Selfie
-    |--------------------------------------------------------------------------
-    */
-
-    if ($error === "") {
-
-        $extension =
-            $allowedTypes[$mime];
-
-        $filename =
-            bin2hex(random_bytes(16)) .
-            "." .
-            $extension;
-
-        $destination =
-            $uploadDirectory .
-            $filename;
-
-
-        if (
-            !move_uploaded_file(
-                $_FILES["selfie"]["tmp_name"],
-                $destination
-            )
-        ) {
-
-            $error =
-                "Unable to save your selfie. Please try again.";
-        }
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Create Employee
-    |--------------------------------------------------------------------------
-    */
-
-    if ($error === "") {
-
-        $selfiePath =
-            "uploads/employees/" .
-            $filename;
-
-
-        $stmt = $conn->prepare(
-            "INSERT INTO employees
-            (
+        $stmt = $conn->prepare("
+            INSERT INTO employees (
                 full_name,
                 normalized_name,
+                gender,
+                device_token,
                 selfie,
                 registration_status,
                 voting_status
             )
-            VALUES
-            (
+            VALUES (
                 ?,
                 ?,
                 ?,
-                'pending',
+                ?,
+                ?,
+                'approved',
                 'not_voted'
-            )"
-        );
+            )
+        ");
 
 
         if (!$stmt) {
 
-            if (file_exists($destination)) {
-                unlink($destination);
+            if ($selfiePath) {
+
+                @unlink(
+                    __DIR__ .
+                    "/" .
+                    $selfiePath
+                );
             }
 
-            $error =
-                "Unable to complete registration.";
+
+            $errors[] =
+                "Unable to prepare registration.";
 
         } else {
 
             $stmt->bind_param(
-                "sss",
+                "sssss",
                 $fullName,
                 $normalizedName,
+                $gender,
+                $deviceToken,
                 $selfiePath
             );
 
@@ -312,8 +650,6 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                 $employeeId =
                     $stmt->insert_id;
 
-                $stmt->close();
-
 
                 /*
                 |--------------------------------------------------------------------------
@@ -321,1032 +657,1204 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
                 |--------------------------------------------------------------------------
                 */
 
-                $_SESSION["employee_id"] =
-                    $employeeId;
+                $_SESSION["voting_employee_id"] =
+                    (int) $employeeId;
 
-                $_SESSION["employee_name"] =
-                    $fullName;
+                $_SESSION["voting_device_token"] =
+                    $deviceToken;
 
 
-                $success = true;
+                $_SESSION["registration_success"] =
+                    true;
+
+
+                /*
+                |--------------------------------------------------------------------------
+                | Registration Successful
+                |--------------------------------------------------------------------------
+                */
+
+                $registrationSuccess =
+                    true;
+
 
             } else {
 
-                if (file_exists($destination)) {
-                    unlink($destination);
+                /*
+                |--------------------------------------------------------------------------
+                | Remove Image If DB Insert Failed
+                |--------------------------------------------------------------------------
+                */
+
+                if ($selfiePath) {
+
+                    @unlink(
+                        __DIR__ .
+                        "/" .
+                        $selfiePath
+                    );
                 }
 
 
-                if ($conn->errno === 1062) {
+                /*
+                |--------------------------------------------------------------------------
+                | Duplicate Registration
+                |--------------------------------------------------------------------------
+                */
 
-                    $error =
-                        "This employee name is already registered.";
+                if (
+                    $conn->errno === 1062
+                ) {
+
+                    $errors[] =
+                        "This employee is already registered.";
 
                 } else {
 
-                    $error =
-                        "Unable to complete registration. Please try again.";
+                    $errors[] =
+                        "Registration failed. Please try again.";
                 }
-
-
-                $stmt->close();
             }
+
+
+            $stmt->close();
         }
     }
 }
 
 ?>
-
 <!DOCTYPE html>
-
 <html lang="en">
 
 <head>
 
+    <meta charset="UTF-8">
 
-<meta charset="UTF-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
 
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
->
+    <title>
+        Foundation Day 2026 | Registration
+    </title>
 
-<meta
-    name="theme-color"
-    content="#0d6efd"
->
 
-<title>
-    Foundation Day 2026 - Registration
-</title>
+    <!-- Bootstrap -->
 
+    <link
+        href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+        rel="stylesheet"
+    >
 
-<style>
 
-    * {
-        box-sizing: border-box;
-    }
+    <!-- Bootstrap Icons -->
 
+    <link
+        href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css"
+        rel="stylesheet"
+    >
 
-    html,
-    body {
 
-        margin: 0;
-        padding: 0;
+    <style>
 
-        min-height: 100%;
-
-        font-family:
-            Inter,
-            -apple-system,
-            BlinkMacSystemFont,
-            "Segoe UI",
-            sans-serif;
-
-        background: #f4f7fb;
-
-        color: #172033;
-    }
-
-
-    body {
-        min-height: 100vh;
-    }
-
-
-    .page {
-
-        min-height: 100vh;
-
-        display: flex;
-
-        align-items: center;
-
-        justify-content: center;
-
-        padding: 20px 14px;
-    }
-
-
-    .registration-card {
-
-        width: 100%;
-
-        max-width: 460px;
-
-        background: #ffffff;
-
-        border-radius: 20px;
-
-        box-shadow:
-            0 12px 35px
-            rgba(0, 0, 0, 0.08);
-
-        overflow: hidden;
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Header
-    |--------------------------------------------------------------------------
-    */
-
-    .header {
-
-        background: #0d6efd;
-
-        color: #ffffff;
-
-        padding: 28px 22px;
-
-        text-align: center;
-    }
-
-
-    .event-icon {
-
-        width: 64px;
-        height: 64px;
-
-        margin: 0 auto 14px;
-
-        border-radius: 50%;
-
-        background:
-            rgba(255, 255, 255, 0.18);
-
-        display: flex;
-
-        align-items: center;
-
-        justify-content: center;
-
-        font-size: 30px;
-    }
-
-
-    .header h1 {
-
-        margin: 0;
-
-        font-size: 24px;
-
-        font-weight: 800;
-    }
-
-
-    .header p {
-
-        margin: 7px 0 0;
-
-        font-size: 14px;
-
-        opacity: 0.9;
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Content
-    |--------------------------------------------------------------------------
-    */
-
-    .content {
-
-        padding: 24px 20px 28px;
-    }
-
-
-    .notice {
-
-        padding: 13px 14px;
-
-        border-radius: 10px;
-
-        margin-bottom: 20px;
-
-        font-size: 14px;
-
-        line-height: 1.5;
-    }
-
-
-    .notice.error {
-
-        background: #fff1f2;
-
-        color: #b42318;
-
-        border:
-            1px solid #fecdd3;
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Fields
-    |--------------------------------------------------------------------------
-    */
-
-    .field {
-
-        margin-bottom: 22px;
-    }
-
-
-    .field-label {
-
-        display: block;
-
-        margin-bottom: 8px;
-
-        font-size: 14px;
-
-        font-weight: 700;
-
-        color: #344054;
-    }
-
-
-    .required {
-
-        color: #dc2626;
-    }
-
-
-    .name-input {
-
-        width: 100%;
-
-        height: 50px;
-
-        padding: 0 14px;
-
-        border:
-            1px solid #d0d5dd;
-
-        border-radius: 10px;
-
-        font-size: 16px;
-
-        outline: none;
-
-        transition: 0.2s;
-    }
-
-
-    .name-input:focus {
-
-        border-color: #0d6efd;
-
-        box-shadow:
-            0 0 0 3px
-            rgba(13, 110, 253, 0.12);
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Selfie Area
-    |--------------------------------------------------------------------------
-    */
-
-    .selfie-wrapper {
-
-        width: 100%;
-    }
-
-
-    .camera-button {
-
-        width: 100%;
-
-        min-height: 270px;
-
-        border:
-            2px dashed #b8c4d4;
-
-        border-radius: 16px;
-
-        background: #f8fafc;
-
-        display: flex;
-
-        flex-direction: column;
-
-        align-items: center;
-
-        justify-content: center;
-
-        text-align: center;
-
-        padding: 25px;
-
-        cursor: pointer;
-
-        transition: 0.2s;
-
-        position: relative;
-
-        overflow: hidden;
-    }
-
-
-    .camera-button:active {
-
-        background: #eef5ff;
-
-        border-color: #0d6efd;
-    }
-
-
-    .camera-icon {
-
-        width: 72px;
-        height: 72px;
-
-        border-radius: 50%;
-
-        background: #e8f1ff;
-
-        color: #0d6efd;
-
-        display: flex;
-
-        align-items: center;
-
-        justify-content: center;
-
-        font-size: 34px;
-
-        margin-bottom: 15px;
-    }
-
-
-    .camera-button strong {
-
-        display: block;
-
-        font-size: 17px;
-
-        margin-bottom: 6px;
-
-        color: #172033;
-    }
-
-
-    .camera-button span {
-
-        color: #667085;
-
-        font-size: 13px;
-
-        line-height: 1.5;
-
-        max-width: 290px;
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Hidden Camera Input
-    |--------------------------------------------------------------------------
-    |
-    | IMPORTANT:
-    |
-    | capture="user"
-    |
-    | tells the mobile browser to use the
-    | front-facing camera.
-    |
-    */
-
-    #selfie {
-
-        display: none;
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Preview
-    |--------------------------------------------------------------------------
-    */
-
-    .preview-container {
-
-        display: none;
-
-        width: 100%;
-
-        border-radius: 16px;
-
-        overflow: hidden;
-
-        background: #101828;
-
-        position: relative;
-    }
-
-
-    #selfiePreview {
-
-        display: block;
-
-        width: 100%;
-
-        max-height: 420px;
-
-        object-fit: cover;
-    }
-
-
-    .selfie-status {
-
-        padding: 11px 13px;
-
-        background: #ecfdf3;
-
-        border:
-            1px solid #abefc6;
-
-        border-radius: 9px;
-
-        color: #067647;
-
-        font-size: 13px;
-
-        margin-top: 10px;
-    }
-
-
-    .retake-button {
-
-        width: 100%;
-
-        height: 46px;
-
-        margin-top: 10px;
-
-        border:
-            1px solid #d0d5dd;
-
-        border-radius: 9px;
-
-        background: #ffffff;
-
-        color: #344054;
-
-        font-size: 14px;
-
-        font-weight: 700;
-
-        cursor: pointer;
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Submit
-    |--------------------------------------------------------------------------
-    */
-
-    .submit-button {
-
-        width: 100%;
-
-        height: 52px;
-
-        border: 0;
-
-        border-radius: 11px;
-
-        background: #0d6efd;
-
-        color: #ffffff;
-
-        font-size: 16px;
-
-        font-weight: 800;
-
-        cursor: pointer;
-
-        transition: 0.2s;
-    }
-
-
-    .submit-button:active {
-
-        transform: scale(0.98);
-    }
-
-
-    .submit-button:disabled {
-
-        opacity: 0.6;
-
-        cursor: not-allowed;
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Requirements
-    |--------------------------------------------------------------------------
-    */
-
-    .requirements {
-
-        margin-top: 20px;
-
-        padding: 14px;
-
-        border-radius: 10px;
-
-        background: #f8fafc;
-    }
-
-
-    .requirements-title {
-
-        font-size: 13px;
-
-        font-weight: 800;
-
-        margin-bottom: 9px;
-
-        color: #344054;
-    }
-
-
-    .requirement {
-
-        display: flex;
-
-        gap: 8px;
-
-        align-items: flex-start;
-
-        font-size: 12px;
-
-        color: #667085;
-
-        margin-top: 7px;
-
-        line-height: 1.4;
-    }
-
-
-    .requirement-check {
-
-        color: #12b76a;
-
-        font-weight: 800;
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Success
-    |--------------------------------------------------------------------------
-    */
-
-    .success-screen {
-
-        text-align: center;
-
-        padding: 10px 0;
-    }
-
-
-    .success-icon {
-
-        width: 72px;
-        height: 72px;
-
-        margin: 0 auto 18px;
-
-        border-radius: 50%;
-
-        background: #dcfae6;
-
-        color: #067647;
-
-        display: flex;
-
-        align-items: center;
-
-        justify-content: center;
-
-        font-size: 36px;
-    }
-
-
-    .success-screen h2 {
-
-        margin: 0 0 8px;
-
-        font-size: 22px;
-    }
-
-
-    .success-screen p {
-
-        margin: 0 0 20px;
-
-        color: #667085;
-
-        line-height: 1.6;
-
-        font-size: 14px;
-    }
-
-
-    .status-box {
-
-        background: #fff8e7;
-
-        border:
-            1px solid #f5d98a;
-
-        border-radius: 12px;
-
-        padding: 14px;
-
-        text-align: left;
-
-        font-size: 13px;
-
-        line-height: 1.5;
-
-        color: #795900;
-    }
-
-
-    @media (min-width: 600px) {
-
-        .page {
-            padding: 40px 20px;
+        :root {
+            --primary: #1d4ed8;
+            --primary-dark: #1e3a8a;
+            --background: #f5f7fb;
+            --text: #1f2937;
+            --muted: #6b7280;
+            --border: #e5e7eb;
         }
 
-        .content {
+
+        * {
+            box-sizing: border-box;
+        }
+
+
+        body {
+
+            margin: 0;
+
+            min-height: 100vh;
+
+            background:
+                var(--background);
+
+            color:
+                var(--text);
+
+            font-family:
+                Inter,
+                -apple-system,
+                BlinkMacSystemFont,
+                "Segoe UI",
+                sans-serif;
+        }
+
+
+        .page {
+
+            min-height: 100vh;
+
+            display: flex;
+
+            align-items: center;
+
+            justify-content: center;
+
+            padding: 30px 15px;
+        }
+
+
+        .registration-card {
+
+            width: 100%;
+
+            max-width: 560px;
+
+            background: #ffffff;
+
+            border:
+                1px solid var(--border);
+
+            border-radius: 16px;
+
+            box-shadow:
+                0 12px 35px
+                rgba(15, 23, 42, 0.08);
+
+            overflow: hidden;
+        }
+
+
+        /* =========================================================
+           HEADER
+        ========================================================= */
+
+        .card-header {
+
+            padding:
+                28px 30px 22px;
+
+            background: #ffffff;
+
+            border-bottom:
+                1px solid var(--border);
+        }
+
+
+        .brand {
+
+            display: flex;
+
+            align-items: center;
+
+            gap: 14px;
+        }
+
+
+        .brand-icon {
+
+            width: 48px;
+
+            height: 48px;
+
+            border-radius: 12px;
+
+            background:
+                var(--primary);
+
+            color: #ffffff;
+
+            display: flex;
+
+            align-items: center;
+
+            justify-content: center;
+
+            font-size: 22px;
+        }
+
+
+        .title {
+
+            margin: 0;
+
+            font-size: 22px;
+
+            font-weight: 800;
+
+            color: #111827;
+        }
+
+
+        .subtitle {
+
+            margin-top: 3px;
+
+            font-size: 13px;
+
+            color:
+                var(--muted);
+        }
+
+
+        /* =========================================================
+           BODY
+        ========================================================= */
+
+        .card-body {
+
             padding: 30px;
         }
 
-        .header {
-            padding: 32px;
+
+        .section-title {
+
+            margin-bottom: 22px;
         }
-    }
 
-</style>
 
+        .section-title h2 {
+
+            margin: 0;
+
+            font-size: 20px;
+
+            font-weight: 750;
+        }
+
+
+        .section-title p {
+
+            margin:
+                5px 0 0;
+
+            color:
+                var(--muted);
+
+            font-size: 14px;
+        }
+
+
+        /* =========================================================
+           FORM
+        ========================================================= */
+
+        .form-label {
+
+            font-weight: 650;
+
+            font-size: 14px;
+
+            margin-bottom: 7px;
+        }
+
+
+        .form-control,
+        .form-select {
+
+            min-height: 46px;
+
+            border-color:
+                var(--border);
+
+            border-radius: 9px;
+        }
+
+
+        .form-control:focus,
+        .form-select:focus {
+
+            border-color:
+                var(--primary);
+
+            box-shadow:
+                0 0 0 3px
+                rgba(29, 78, 216, 0.10);
+        }
+
+
+        /* =========================================================
+           PHOTO
+        ========================================================= */
+
+        .photo-section {
+
+            margin-top: 22px;
+        }
+
+
+        .camera-container {
+
+            width: 100%;
+
+            height: 320px;
+
+            background:
+                #f8fafc;
+
+            border:
+                1px solid var(--border);
+
+            border-radius: 12px;
+
+            overflow: hidden;
+
+            position: relative;
+
+            display: flex;
+
+            align-items: center;
+
+            justify-content: center;
+        }
+
+
+        #camera,
+        #preview {
+
+            width: 100%;
+
+            height: 100%;
+
+            object-fit: cover;
+        }
+
+
+        .camera-placeholder {
+
+            text-align: center;
+
+            color:
+                var(--muted);
+
+            padding: 25px;
+        }
+
+
+        .camera-placeholder i {
+
+            display: block;
+
+            font-size: 44px;
+
+            margin-bottom: 10px;
+
+            color:
+                #94a3b8;
+        }
+
+
+        .camera-loading {
+
+            position: absolute;
+
+            inset: 0;
+
+            background:
+                rgba(248, 250, 252, 0.95);
+
+            display: none;
+
+            align-items: center;
+
+            justify-content: center;
+
+            gap: 9px;
+
+            z-index: 5;
+
+            color:
+                var(--muted);
+
+            font-size: 14px;
+        }
+
+
+        .camera-controls {
+
+            display: flex;
+
+            flex-wrap: wrap;
+
+            gap: 8px;
+
+            margin-top: 12px;
+        }
+
+
+        .camera-controls .btn {
+
+            flex: 1 1 auto;
+
+            min-height: 43px;
+        }
+
+
+        .photo-note {
+
+            margin-top: 9px;
+
+            font-size: 12px;
+
+            color:
+                var(--muted);
+        }
+
+
+        /* =========================================================
+           REGISTER BUTTON
+        ========================================================= */
+
+        .btn-register {
+
+            width: 100%;
+
+            min-height: 48px;
+
+            margin-top: 24px;
+
+            border-radius: 9px;
+
+            background:
+                var(--primary);
+
+            border-color:
+                var(--primary);
+
+            font-weight: 700;
+        }
+
+
+        .btn-register:hover {
+
+            background:
+                var(--primary-dark);
+
+            border-color:
+                var(--primary-dark);
+        }
+
+
+        /* =========================================================
+           SUCCESS
+        ========================================================= */
+
+        .success-container {
+
+            text-align: center;
+
+            padding:
+                20px 0 10px;
+        }
+
+
+        .success-icon {
+
+            width: 82px;
+
+            height: 82px;
+
+            margin:
+                0 auto 22px;
+
+            border-radius: 50%;
+
+            background:
+                #dcfce7;
+
+            color:
+                #16a34a;
+
+            display: flex;
+
+            align-items: center;
+
+            justify-content: center;
+
+            font-size: 42px;
+        }
+
+
+        .success-title {
+
+            margin: 0;
+
+            font-size: 25px;
+
+            font-weight: 800;
+
+            color:
+                #111827;
+        }
+
+
+        .success-message {
+
+            margin:
+                10px auto 0;
+
+            max-width: 420px;
+
+            color:
+                var(--muted);
+
+            font-size: 15px;
+
+            line-height: 1.6;
+        }
+
+
+        .success-status {
+
+            margin-top: 25px;
+
+            padding: 15px;
+
+            border:
+                1px solid #dcfce7;
+
+            border-radius: 10px;
+
+            background:
+                #f0fdf4;
+        }
+
+
+        .success-status-label {
+
+            font-size: 12px;
+
+            color:
+                var(--muted);
+
+            margin-bottom: 4px;
+        }
+
+
+        .success-status-value {
+
+            color:
+                #15803d;
+
+            font-weight: 700;
+
+            font-size: 14px;
+        }
+
+
+        .success-instruction {
+
+            margin-top: 22px;
+
+            color:
+                #64748b;
+
+            font-size: 13px;
+
+            line-height: 1.6;
+        }
+
+
+        /* =========================================================
+           FOOTER
+        ========================================================= */
+
+        .footer-note {
+
+            text-align: center;
+
+            padding:
+                18px 30px;
+
+            border-top:
+                1px solid var(--border);
+
+            color:
+                var(--muted);
+
+            font-size: 12px;
+        }
+
+
+        /* =========================================================
+           MOBILE
+        ========================================================= */
+
+        @media (max-width: 576px) {
+
+            .page {
+
+                padding: 15px;
+            }
+
+
+            .card-header,
+            .card-body {
+
+                padding: 22px;
+            }
+
+
+            .camera-container {
+
+                height: 280px;
+            }
+
+
+            .camera-controls {
+
+                flex-direction: column;
+            }
+
+
+            .success-title {
+
+                font-size: 22px;
+            }
+
+        }
+
+    </style>
 
 </head>
+
 
 <body>
 
 <div class="page">
 
-
-<div class="registration-card">
-
-
-    <!-- ======================================================
-         HEADER
-    ======================================================= -->
-
-    <div class="header">
-
-        <div class="event-icon">
-            🎉
-        </div>
-
-        <h1>
-            Foundation Day 2026
-        </h1>
-
-        <p>
-            Employee Registration
-        </p>
-
-    </div>
+    <div class="registration-card">
 
 
-    <!-- ======================================================
-         CONTENT
-    ======================================================= -->
+        <!-- =====================================================
+             HEADER
+        ====================================================== -->
 
-    <div class="content">
+        <div class="card-header">
 
+            <div class="brand">
 
-        <?php if ($success): ?>
+                <div class="brand-icon">
 
+                    <i class="bi bi-stars"></i>
 
-            <!-- ==================================================
-                 SUCCESS
-            =================================================== -->
-
-            <div class="success-screen">
-
-                <div class="success-icon">
-                    ✓
                 </div>
 
 
-                <h2>
-                    Registration Submitted
-                </h2>
+                <div>
 
+                    <h1 class="title">
+                        Foundation Day 2026
+                    </h1>
 
-                <p>
-
-                    Thank you,
-
-                    <strong>
-                        <?= e($_SESSION["employee_name"]) ?>
-                    </strong>.
-
-                </p>
-
-
-                <div class="status-box">
-
-                    <strong>
-                        Your registration is pending approval.
-                    </strong>
-
-                    <br>
-                    <br>
-
-                    The event administrator will verify
-                    your name and selfie.
-
-                    <br>
-                    <br>
-
-                    You will only be allowed to vote after
-                    your registration has been approved.
+                    <div class="subtitle">
+                        Employee Registration
+                    </div>
 
                 </div>
 
             </div>
 
+        </div>
 
-        <?php else: ?>
+
+        <!-- =====================================================
+             BODY
+        ====================================================== -->
+
+        <div class="card-body">
 
 
-            <?php if ($error !== ""): ?>
+            <?php if ($registrationSuccess): ?>
 
-                <div class="notice error">
 
-                    <?= e($error) ?>
+                <!-- =================================================
+                     REGISTRATION SUCCESS
+                ================================================== -->
+
+                <div class="success-container">
+
+
+                    <div class="success-icon">
+
+                        <i class="bi bi-check-lg"></i>
+
+                    </div>
+
+
+                    <h2 class="success-title">
+
+                        Registration Successful
+
+                    </h2>
+
+
+                    <p class="success-message">
+
+                        Thank you,
+                        <strong>
+                            <?php
+                            echo htmlspecialchars(
+                                $fullName,
+                                ENT_QUOTES,
+                                "UTF-8"
+                            );
+                            ?>
+                        </strong>.
+
+                        Your registration has been
+                        successfully recorded.
+
+                    </p>
+
+
+                    <div class="success-status">
+
+                        <div class="success-status-label">
+
+                            Registration Status
+
+                        </div>
+
+
+                        <div class="success-status-value">
+
+                            <i
+                                class="bi bi-check-circle-fill me-1"
+                            ></i>
+
+                            Registered Successfully
+
+                        </div>
+
+                    </div>
+
+
+                    <div class="success-instruction">
+
+                        Please wait for further instructions
+                        regarding the Foundation Day voting.
+
+                    </div>
+
 
                 </div>
 
-            <?php endif; ?>
+
+            <?php else: ?>
 
 
-            <!-- ==================================================
-                 REGISTRATION FORM
-            =================================================== -->
+                <!-- =================================================
+                     REGISTRATION FORM
+                ================================================== -->
 
-            <form
-                method="POST"
-                enctype="multipart/form-data"
-                id="registrationForm"
-            >
+                <div class="section-title">
 
+                    <h2>
+                        Register to Vote
+                    </h2>
 
-                <!-- NAME -->
-
-                <div class="field">
-
-                    <label
-                        class="field-label"
-                        for="full_name"
-                    >
-
-                        Full Name
-
-                        <span class="required">
-                            *
-                        </span>
-
-                    </label>
-
-
-                    <input
-                        type="text"
-                        id="full_name"
-                        name="full_name"
-                        class="name-input"
-                        placeholder="Enter your full name"
-                        maxlength="150"
-                        autocomplete="name"
-                        required
-                        value="<?= e($_POST["full_name"] ?? "") ?>"
-                    >
+                    <p>
+                        Enter your information to participate
+                        in the Foundation Day voting.
+                    </p>
 
                 </div>
 
 
-                <!-- SELFIE -->
+                <!-- ERRORS -->
 
-                <div class="field">
+                <?php if (!empty($errors)): ?>
 
-                    <label class="field-label">
+                    <div
+                        class="alert alert-danger"
+                        role="alert"
+                    >
 
-                        Selfie
+                        <div class="fw-semibold mb-1">
 
-                        <span class="required">
-                            *
-                        </span>
+                            Registration could not
+                            be completed.
 
-                    </label>
-
-
-                    <div class="selfie-wrapper">
-
-
-                        <!--
-                        =================================================
-                        IMPORTANT MOBILE CAMERA BUTTON
-                        =================================================
-
-                        The actual file input uses:
-
-                        accept="image/*"
-                        capture="user"
-
-                        On supported phones, tapping the button
-                        opens the FRONT CAMERA directly.
-                        -->
-
-                        <label
-                            for="selfie"
-                            class="camera-button"
-                            id="cameraButton"
-                        >
-
-                            <div class="camera-icon">
-                                📷
-                            </div>
+                        </div>
 
 
-                            <strong>
-                                Take Your Selfie
-                            </strong>
+                        <ul class="mb-0 ps-3">
+
+                            <?php foreach (
+                                $errors
+                                as $error
+                            ): ?>
+
+                                <li>
+
+                                    <?php
+                                    echo htmlspecialchars(
+                                        $error,
+                                        ENT_QUOTES,
+                                        "UTF-8"
+                                    );
+                                    ?>
+
+                                </li>
+
+                            <?php endforeach; ?>
+
+                        </ul>
+
+                    </div>
+
+                <?php endif; ?>
 
 
-                            <span>
+                <!-- EXISTING REGISTRATION -->
 
-                                Tap here to open your
-                                phone camera and take a selfie.
+                <?php if ($existingRegistration): ?>
 
-                            </span>
+                    <div
+                        class="alert alert-warning"
+                        role="alert"
+                    >
 
-                        </label>
+                        <div class="fw-semibold mb-1">
 
+                            Already Registered
 
-                        <input
-                            type="file"
-                            id="selfie"
-                            name="selfie"
-                            accept="image/*"
-                            capture="user"
-                            required
-                        >
+                        </div>
 
 
-                        <!-- PREVIEW -->
+                        <div>
 
-                        <div
-                            class="preview-container"
-                            id="previewContainer"
-                        >
+                            This device has already been
+                            registered for Foundation Day 2026.
 
-                            <img
-                                id="selfiePreview"
-                                alt="Selfie preview"
+                        </div>
+
+                    </div>
+
+                <?php else: ?>
+
+
+                    <form
+                        method="POST"
+                        enctype="multipart/form-data"
+                        id="registrationForm"
+                    >
+
+
+                        <!-- FULL NAME -->
+
+                        <div class="mb-3">
+
+                            <label
+                                for="full_name"
+                                class="form-label"
+                            >
+
+                                Full Name
+
+                            </label>
+
+
+                            <input
+                                type="text"
+                                class="form-control"
+                                id="full_name"
+                                name="full_name"
+                                value="<?php
+                                echo htmlspecialchars(
+                                    $fullName,
+                                    ENT_QUOTES,
+                                    "UTF-8"
+                                );
+                                ?>"
+                                placeholder="Enter your full name"
+                                maxlength="150"
+                                autocomplete="name"
+                                required
                             >
 
                         </div>
 
 
-                        <div
-                            class="selfie-status"
-                            id="selfieStatus"
-                            style="display:none;"
-                        >
+                        <!-- GENDER -->
 
-                            ✓ Selfie captured successfully.
+                        <div class="mb-3">
+
+                            <label
+                                for="gender"
+                                class="form-label"
+                            >
+
+                                Gender
+
+                            </label>
+
+
+                            <select
+                                class="form-select"
+                                id="gender"
+                                name="gender"
+                                required
+                            >
+
+                                <option value="">
+
+                                    Select gender
+
+                                </option>
+
+
+                                <option
+                                    value="male"
+                                    <?php
+                                    echo $gender === "male"
+                                        ? "selected"
+                                        : "";
+                                    ?>
+                                >
+
+                                    Male
+
+                                </option>
+
+
+                                <option
+                                    value="female"
+                                    <?php
+                                    echo $gender === "female"
+                                        ? "selected"
+                                        : "";
+                                    ?>
+                                >
+
+                                    Female
+
+                                </option>
+
+                            </select>
 
                         </div>
 
 
+                        <!-- PHOTO -->
+
+                        <div class="photo-section">
+
+                            <label class="form-label">
+
+                                Profile Photo
+
+                            </label>
+
+
+                            <div
+                                class="camera-container"
+                            >
+
+
+                                <!-- PLACEHOLDER -->
+
+                                <div
+                                    class="camera-placeholder"
+                                    id="cameraPlaceholder"
+                                >
+
+                                    <i
+                                        class="bi bi-person-circle"
+                                    ></i>
+
+
+                                    <div class="fw-semibold">
+
+                                        No photo selected
+
+                                    </div>
+
+
+                                    <div class="small mt-1">
+
+                                        Take a selfie or
+                                        upload a photo.
+
+                                    </div>
+
+                                </div>
+
+
+                                <!-- CAMERA LOADING -->
+
+                                <div
+                                    class="camera-loading"
+                                    id="cameraLoading"
+                                >
+
+                                    <div
+                                        class="spinner-border spinner-border-sm"
+                                        role="status"
+                                    ></div>
+
+
+                                    Opening camera...
+
+                                </div>
+
+
+                                <!-- CAMERA -->
+
+                                <video
+                                    id="camera"
+                                    autoplay
+                                    playsinline
+                                    muted
+                                    style="display:none;"
+                                ></video>
+
+
+                                <!-- PREVIEW -->
+
+                                <img
+                                    id="preview"
+                                    alt="Photo Preview"
+                                    style="display:none;"
+                                >
+
+                            </div>
+
+
+                            <!-- FILE -->
+
+                            <input
+                                type="file"
+                                id="selfie"
+                                name="selfie"
+                                accept="image/jpeg,image/png,image/webp"
+                                hidden
+                            >
+
+
+                            <!-- CONTROLS -->
+
+                            <div class="camera-controls">
+
+
+                                <button
+                                    type="button"
+                                    class="btn btn-outline-primary"
+                                    id="takeSelfieBtn"
+                                >
+
+                                    <i
+                                        class="bi bi-camera me-1"
+                                    ></i>
+
+                                    Take Selfie
+
+                                </button>
+
+
+                                <button
+                                    type="button"
+                                    class="btn btn-primary"
+                                    id="captureBtn"
+                                    style="display:none;"
+                                >
+
+                                    <i
+                                        class="bi bi-camera-fill me-1"
+                                    ></i>
+
+                                    Capture Photo
+
+                                </button>
+
+
+                                <button
+                                    type="button"
+                                    class="btn btn-outline-secondary"
+                                    id="uploadBtn"
+                                >
+
+                                    <i
+                                        class="bi bi-upload me-1"
+                                    ></i>
+
+                                    Upload Photo
+
+                                </button>
+
+
+                                <button
+                                    type="button"
+                                    class="btn btn-outline-secondary"
+                                    id="retakeBtn"
+                                    style="display:none;"
+                                >
+
+                                    <i
+                                        class="bi bi-arrow-counterclockwise me-1"
+                                    ></i>
+
+                                    Change Photo
+
+                                </button>
+
+                            </div>
+
+
+                            <div class="photo-note">
+
+                                JPG, PNG, or WEBP.
+                                Maximum original upload size:
+                                5 MB.
+
+                            </div>
+
+                        </div>
+
+
+                        <!-- SUBMIT -->
+
                         <button
-                            type="button"
-                            class="retake-button"
-                            id="retakeButton"
-                            style="display:none;"
+                            type="submit"
+                            class="btn btn-primary btn-register"
+                            id="registerBtn"
                         >
 
-                            🔄 Retake Selfie
+                            <i
+                                class="bi bi-check-circle me-1"
+                            ></i>
+
+                            Register
 
                         </button>
 
 
-                    </div>
+                    </form>
 
-                </div>
+                <?php endif; ?>
 
-
-                <!-- SUBMIT -->
-
-                <button
-                    type="submit"
-                    class="submit-button"
-                    id="submitButton"
-                >
-
-                    Submit Registration
-
-                </button>
+            <?php endif; ?>
 
 
-            </form>
+        </div>
 
 
-            <!-- ==================================================
-                 REQUIREMENTS
-            =================================================== -->
+        <!-- =====================================================
+             FOOTER
+        ====================================================== -->
 
-            <div class="requirements">
+        <div class="footer-note">
 
-                <div class="requirements-title">
+            Foundation Day 2026
+            &nbsp;•&nbsp;
+            Employee Voting System
 
-                    Registration Requirements
-
-                </div>
-
-
-                <div class="requirement">
-
-                    <span class="requirement-check">
-                        ✓
-                    </span>
-
-                    <span>
-                        Enter your real full name.
-                    </span>
-
-                </div>
-
-
-                <div class="requirement">
-
-                    <span class="requirement-check">
-                        ✓
-                    </span>
-
-                    <span>
-                        A selfie is required.
-                    </span>
-
-                </div>
-
-
-                <div class="requirement">
-
-                    <span class="requirement-check">
-                        ✓
-                    </span>
-
-                    <span>
-                        Your selfie will be reviewed
-                        by the event administrator.
-                    </span>
-
-                </div>
-
-
-                <div class="requirement">
-
-                    <span class="requirement-check">
-                        ✓
-                    </span>
-
-                    <span>
-                        Only approved employees can vote.
-                    </span>
-
-                </div>
-
-            </div>
-
-
-        <?php endif; ?>
+        </div>
 
 
     </div>
@@ -1354,9 +1862,18 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 </div>
 
 
-</div>
-
 <script>
+
+/*
+|--------------------------------------------------------------------------
+| Image Settings
+|--------------------------------------------------------------------------
+*/
+
+const MAX_IMAGE_WIDTH = 800;
+const MAX_IMAGE_HEIGHT = 800;
+const JPEG_QUALITY = 0.82;
+
 
 /*
 |--------------------------------------------------------------------------
@@ -1364,103 +1881,160 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
 |--------------------------------------------------------------------------
 */
 
+const camera =
+    document.getElementById("camera");
+
+const preview =
+    document.getElementById("preview");
+
 const selfieInput =
     document.getElementById("selfie");
 
-const cameraButton =
-    document.getElementById("cameraButton");
+const cameraPlaceholder =
+    document.getElementById(
+        "cameraPlaceholder"
+    );
 
-const previewContainer =
-    document.getElementById("previewContainer");
+const cameraLoading =
+    document.getElementById(
+        "cameraLoading"
+    );
 
-const selfiePreview =
-    document.getElementById("selfiePreview");
+const takeSelfieBtn =
+    document.getElementById(
+        "takeSelfieBtn"
+    );
 
-const selfieStatus =
-    document.getElementById("selfieStatus");
+const captureBtn =
+    document.getElementById(
+        "captureBtn"
+    );
 
-const retakeButton =
-    document.getElementById("retakeButton");
+const uploadBtn =
+    document.getElementById(
+        "uploadBtn"
+    );
+
+const retakeBtn =
+    document.getElementById(
+        "retakeBtn"
+    );
 
 const registrationForm =
-    document.getElementById("registrationForm");
+    document.getElementById(
+        "registrationForm"
+    );
 
-const submitButton =
-    document.getElementById("submitButton");
+const registerBtn =
+    document.getElementById(
+        "registerBtn"
+    );
+
+
+let stream = null;
 
 
 /*
 |--------------------------------------------------------------------------
-| Selfie Selected
+| Stop Camera
 |--------------------------------------------------------------------------
 */
 
-if (selfieInput) {
+function stopCamera() {
 
-    selfieInput.addEventListener(
-        "change",
-        function () {
+    if (stream) {
 
+        stream
+            .getTracks()
+            .forEach(
+                function(track) {
 
-            if (
-                !this.files ||
-                this.files.length === 0
-            ) {
+                    track.stop();
 
-                return;
-            }
+                }
+            );
 
-
-            const file =
-                this.files[0];
+        stream = null;
+    }
 
 
-            /*
-            |--------------------------------------------------------------------------
-            | Validate image
-            |--------------------------------------------------------------------------
-            */
+    if (camera) {
 
-            if (
-                !file.type.startsWith("image/")
-            ) {
+        camera.srcObject = null;
 
-                alert(
-                    "Please take a valid photo."
-                );
-
-                this.value = "";
-
-                return;
-            }
+    }
+}
 
 
-            /*
-            |--------------------------------------------------------------------------
-            | Validate size
-            |--------------------------------------------------------------------------
-            */
+/*
+|--------------------------------------------------------------------------
+| Show Preview
+|--------------------------------------------------------------------------
+*/
 
-            if (
-                file.size >
-                5 * 1024 * 1024
-            ) {
+function showPreview(file) {
 
-                alert(
-                    "Your selfie must not exceed 5MB."
-                );
+    if (!file || !preview) {
 
-                this.value = "";
+        return;
 
-                return;
-            }
+    }
 
 
-            /*
-            |--------------------------------------------------------------------------
-            | Preview
-            |--------------------------------------------------------------------------
-            */
+    const url =
+        URL.createObjectURL(file);
+
+
+    preview.src = url;
+
+
+    preview.onload =
+        function() {
+
+            URL.revokeObjectURL(url);
+
+        };
+
+
+    camera.style.display =
+        "none";
+
+
+    cameraPlaceholder.style.display =
+        "none";
+
+
+    preview.style.display =
+        "block";
+
+
+    takeSelfieBtn.style.display =
+        "none";
+
+
+    captureBtn.style.display =
+        "none";
+
+
+    uploadBtn.style.display =
+        "none";
+
+
+    retakeBtn.style.display =
+        "inline-block";
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Compress Image
+|--------------------------------------------------------------------------
+*/
+
+function compressImage(file) {
+
+    return new Promise(
+        function(resolve, reject) {
 
             const reader =
                 new FileReader();
@@ -1469,24 +2043,129 @@ if (selfieInput) {
             reader.onload =
                 function(event) {
 
-                    selfiePreview.src =
+                    const image =
+                        new Image();
+
+
+                    image.onload =
+                        function() {
+
+                            let width =
+                                image.width;
+
+                            let height =
+                                image.height;
+
+
+                            const scale =
+                                Math.min(
+                                    1,
+                                    MAX_IMAGE_WIDTH / width,
+                                    MAX_IMAGE_HEIGHT / height
+                                );
+
+
+                            width =
+                                Math.round(
+                                    width * scale
+                                );
+
+
+                            height =
+                                Math.round(
+                                    height * scale
+                                );
+
+
+                            const canvas =
+                                document.createElement(
+                                    "canvas"
+                                );
+
+
+                            canvas.width =
+                                width;
+
+
+                            canvas.height =
+                                height;
+
+
+                            const context =
+                                canvas.getContext(
+                                    "2d"
+                                );
+
+
+                            context.drawImage(
+                                image,
+                                0,
+                                0,
+                                width,
+                                height
+                            );
+
+
+                            canvas.toBlob(
+                                function(blob) {
+
+                                    if (!blob) {
+
+                                        reject(
+                                            new Error(
+                                                "Unable to process image."
+                                            )
+                                        );
+
+                                        return;
+                                    }
+
+
+                                    resolve(
+                                        new File(
+                                            [blob],
+                                            "selfie.jpg",
+                                            {
+                                                type:
+                                                    "image/jpeg"
+                                            }
+                                        )
+                                    );
+
+                                },
+                                "image/jpeg",
+                                JPEG_QUALITY
+                            );
+
+                        };
+
+
+                    image.onerror =
+                        function() {
+
+                            reject(
+                                new Error(
+                                    "Invalid image."
+                                )
+                            );
+
+                        };
+
+
+                    image.src =
                         event.target.result;
+                };
 
 
-                    previewContainer.style.display =
-                        "block";
+            reader.onerror =
+                function() {
 
+                    reject(
+                        new Error(
+                            "Unable to read image."
+                        )
+                    );
 
-                    cameraButton.style.display =
-                        "none";
-
-
-                    selfieStatus.style.display =
-                        "block";
-
-
-                    retakeButton.style.display =
-                        "block";
                 };
 
 
@@ -1499,64 +2178,403 @@ if (selfieInput) {
 
 /*
 |--------------------------------------------------------------------------
-| Retake Selfie
+| Set File
 |--------------------------------------------------------------------------
 */
 
-if (retakeButton) {
+function setFile(file) {
 
-    retakeButton.addEventListener(
-        "click",
-        function() {
-
-
-            /*
-             * Clear previous photo.
-             */
-
-            selfieInput.value = "";
+    const dataTransfer =
+        new DataTransfer();
 
 
-            selfiePreview.src = "";
+    dataTransfer.items.add(file);
 
 
-            previewContainer.style.display =
-                "none";
+    selfieInput.files =
+        dataTransfer.files;
 
 
-            selfieStatus.style.display =
-                "none";
-
-
-            retakeButton.style.display =
-                "none";
-
-
-            cameraButton.style.display =
-                "flex";
-
-
-            /*
-             * Open camera again.
-             */
-
-            setTimeout(
-                function() {
-
-                    selfieInput.click();
-
-                },
-                100
-            );
-
-        }
-    );
+    showPreview(file);
 }
 
 
 /*
 |--------------------------------------------------------------------------
-| Form Submit
+| Take Selfie
+|--------------------------------------------------------------------------
+*/
+
+if (takeSelfieBtn) {
+
+    takeSelfieBtn.addEventListener(
+        "click",
+        async function() {
+
+            if (
+                !navigator.mediaDevices ||
+                !navigator.mediaDevices.getUserMedia
+            ) {
+
+                alert(
+                    "Camera access is not available in this browser. Please use Upload Photo."
+                );
+
+                return;
+            }
+
+
+            cameraLoading.style.display =
+                "flex";
+
+
+            try {
+
+                stream =
+                    await navigator.mediaDevices
+                        .getUserMedia({
+
+                            video: {
+
+                                facingMode: {
+                                    ideal: "user"
+                                },
+
+                                width: {
+                                    ideal: 1280
+                                },
+
+                                height: {
+                                    ideal: 720
+                                }
+
+                            },
+
+                            audio: false
+
+                        });
+
+
+                camera.srcObject =
+                    stream;
+
+
+                await camera.play();
+
+
+                cameraPlaceholder.style.display =
+                    "none";
+
+
+                camera.style.display =
+                    "block";
+
+
+                preview.style.display =
+                    "none";
+
+
+                takeSelfieBtn.style.display =
+                    "none";
+
+
+                captureBtn.style.display =
+                    "inline-block";
+
+
+            } catch (error) {
+
+                console.error(error);
+
+
+                alert(
+                    "Unable to access the camera. Please allow camera permission or use Upload Photo."
+                );
+
+
+            } finally {
+
+                cameraLoading.style.display =
+                    "none";
+
+            }
+
+        }
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Capture Photo
+|--------------------------------------------------------------------------
+*/
+
+if (captureBtn) {
+
+    captureBtn.addEventListener(
+        "click",
+        function() {
+
+            if (!stream) {
+
+                return;
+
+            }
+
+
+            const width =
+                camera.videoWidth;
+
+
+            const height =
+                camera.videoHeight;
+
+
+            if (!width || !height) {
+
+                alert(
+                    "Camera is not ready yet. Please try again."
+                );
+
+                return;
+
+            }
+
+
+            let targetWidth =
+                width;
+
+
+            let targetHeight =
+                height;
+
+
+            const scale =
+                Math.min(
+                    1,
+                    MAX_IMAGE_WIDTH / targetWidth,
+                    MAX_IMAGE_HEIGHT / targetHeight
+                );
+
+
+            targetWidth =
+                Math.round(
+                    targetWidth * scale
+                );
+
+
+            targetHeight =
+                Math.round(
+                    targetHeight * scale
+                );
+
+
+            const canvas =
+                document.createElement(
+                    "canvas"
+                );
+
+
+            canvas.width =
+                targetWidth;
+
+
+            canvas.height =
+                targetHeight;
+
+
+            const context =
+                canvas.getContext(
+                    "2d"
+                );
+
+
+            context.drawImage(
+                camera,
+                0,
+                0,
+                targetWidth,
+                targetHeight
+            );
+
+
+            canvas.toBlob(
+                function(blob) {
+
+                    if (!blob) {
+
+                        alert(
+                            "Unable to capture photo."
+                        );
+
+                        return;
+
+                    }
+
+
+                    const file =
+                        new File(
+                            [blob],
+                            "selfie.jpg",
+                            {
+                                type:
+                                    "image/jpeg"
+                            }
+                        );
+
+
+                    setFile(file);
+
+                    stopCamera();
+
+                },
+                "image/jpeg",
+                JPEG_QUALITY
+            );
+
+        }
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Upload Photo
+|--------------------------------------------------------------------------
+*/
+
+if (uploadBtn) {
+
+    uploadBtn.addEventListener(
+        "click",
+        function() {
+
+            selfieInput.click();
+
+        }
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Uploaded Image
+|--------------------------------------------------------------------------
+*/
+
+if (selfieInput) {
+
+    selfieInput.addEventListener(
+        "change",
+        async function() {
+
+            const file =
+                selfieInput.files[0];
+
+
+            if (!file) {
+
+                return;
+
+            }
+
+
+            try {
+
+                const compressed =
+                    await compressImage(
+                        file
+                    );
+
+
+                setFile(
+                    compressed
+                );
+
+
+            } catch (error) {
+
+                console.error(error);
+
+
+                alert(
+                    "Unable to process the selected photo."
+                );
+
+
+                selfieInput.value = "";
+
+            }
+
+        }
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Change Photo
+|--------------------------------------------------------------------------
+*/
+
+if (retakeBtn) {
+
+    retakeBtn.addEventListener(
+        "click",
+        function() {
+
+            stopCamera();
+
+
+            selfieInput.value =
+                "";
+
+
+            preview.src =
+                "";
+
+
+            preview.style.display =
+                "none";
+
+
+            camera.style.display =
+                "none";
+
+
+            cameraPlaceholder.style.display =
+                "block";
+
+
+            takeSelfieBtn.style.display =
+                "inline-block";
+
+
+            uploadBtn.style.display =
+                "inline-block";
+
+
+            captureBtn.style.display =
+                "none";
+
+
+            retakeBtn.style.display =
+                "none";
+
+        }
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Submit
 |--------------------------------------------------------------------------
 */
 
@@ -1566,42 +2584,54 @@ if (registrationForm) {
         "submit",
         function(event) {
 
-
-            /*
-             * No selfie = no registration.
-             */
-
             if (
-                !selfieInput.files ||
-                selfieInput.files.length === 0
+                !selfieInput.files.length
             ) {
 
                 event.preventDefault();
 
 
                 alert(
-                    "Please take your selfie before submitting your registration."
+                    "Please take a selfie or upload a photo."
                 );
 
 
                 return;
+
             }
 
 
-            /*
-             * Prevent double submission.
-             */
-
-            submitButton.disabled =
+            registerBtn.disabled =
                 true;
 
 
-            submitButton.textContent =
-                "Submitting Registration...";
+            registerBtn.innerHTML =
+                '<span class="spinner-border spinner-border-sm me-2"></span>' +
+                'Registering...';
+
+
+            stopCamera();
 
         }
     );
+
 }
+
+
+/*
+|--------------------------------------------------------------------------
+| Stop Camera When Leaving
+|--------------------------------------------------------------------------
+*/
+
+window.addEventListener(
+    "beforeunload",
+    function() {
+
+        stopCamera();
+
+    }
+);
 
 </script>
 
